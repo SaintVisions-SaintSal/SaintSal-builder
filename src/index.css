@@ -16,10 +16,22 @@
   html, body, #root {
     height: 100%;
     overflow: hidden;
+    position: fixed; /* Prevent bounce scroll on iOS */
+    width: 100%;
   }
   
   body {
     @apply bg-[#0C0C0F] text-[#E8E6E1] font-sans;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+
+  textarea, input, pre, code, .selectable {
+    user-select: text;
   }
 }
 
@@ -182,6 +194,21 @@
 .resizer {
   cursor: col-resize;
   user-select: none;
+}
+
+.code-line {
+  position: relative;
+}
+.code-line::before {
+  content: attr(data-line);
+  position: absolute;
+  left: -40px;
+  width: 30px;
+  text-align: right;
+  color: #2A2A34;
+  font-size: 10px;
+  user-select: none;
+  font-family: 'Geist Mono', monospace;
 }
 
 

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import React, { Component, useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { 
   MessageCircle, 
   Plus, 
@@ -8,10 +8,10 @@ import {
   ChevronRight, 
   Smartphone, 
   Monitor, 
-  User,
+  User as UserIcon,
   MoreHorizontal,
   PlusCircle,
-  Component,
+  Component as LucideComponent,
   Code,
   Play,
   Terminal,
@@ -36,22 +36,105 @@ import {
   Check,
   Layout,
   Maximize2,
-  Minimize2
+  Minimize2,
+  MapPin,
+  Image as ImageIcon,
+  Video,
+  Zap,
+  BrainCircuit,
+  Save
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import JSZip from 'jszip';
+import { 
+  auth, 
+  db, 
+  signInWithGoogle, 
+  logOut, 
+  onAuthStateChanged, 
+  handleFirestoreError, 
+  OperationType 
+} from './firebase';
+import type { User } from './firebase';
+import { 
+  doc, 
+  setDoc, 
+  getDoc, 
+  collection, 
+  query, 
+  where, 
+  onSnapshot, 
+  serverTimestamp, 
+  deleteDoc,
+  orderBy,
+  limit
+} from 'firebase/firestore';
+
+/* ── Error Boundary ────────────────────────────────────────── */
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  errorInfo: string | null;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  public props: ErrorBoundaryProps;
+  public state: ErrorBoundaryState = { hasError: false, errorInfo: null };
+
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.props = props;
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, errorInfo: error.message };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 20, background: '#111', color: '#ff4444', fontFamily: 'monospace', height: '100vh', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', textAlign: 'center' }}>
+          <h2 style={{ marginBottom: 10 }}>Something went wrong</h2>
+          <pre style={{ background: '#000', padding: 15, borderRadius: 8, maxWidth: '80%', overflow: 'auto', fontSize: 12 }}>{this.state.errorInfo}</pre>
+          <button onClick={() => window.location.reload()} style={{ marginTop: 20, padding: '8px 20px', background: '#F59E0B', color: '#000', border: 'none', borderRadius: 4, cursor: 'pointer' }}>Reload Studio</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /* ── Stream API (Gemini Implementation) ────────────────────── */
-const salStream = async (messages, system, onChunk, onDone) => {
+const salStream = async (messages: any[], system: string, onChunk: (text: string) => void, onDone: () => void) => {
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
     const response = await ai.models.generateContentStream({
       model: "gemini-3-flash-preview",
-      contents: messages.map(m => ({ 
-        role: m.role === 'assistant' ? 'model' : 'user', 
-        parts: [{ text: m.content }] 
-      })),
-      config: { systemInstruction: system }
+      contents: messages.map(m => {
+        const parts: any[] = [{ text: m.content }];
+        if (m.attachments && m.attachments.length > 0) {
+          m.attachments.forEach((att: any) => {
+            parts.push({
+              inlineData: {
+                mimeType: att.mimeType || "image/png",
+                data: att.data.split(",")[1] // Remove data:image/png;base64,
+              }
+            });
+          });
+        }
+        return { 
+          role: m.role === 'assistant' ? 'model' : 'user', 
+          parts
+        };
+      }),
+      config: { 
+        systemInstruction: system,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
+      }
     });
 
     for await (const chunk of response) {
@@ -65,26 +148,68 @@ const salStream = async (messages, system, onChunk, onDone) => {
   }
 };
 
+const generateConcept = async (prompt: string, attachments: any[] = []) => {
+  try {
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+    const parts: any[] = [{ text: `A high-fidelity iOS app UI mockup for: ${prompt}. Professional design, clean aesthetic, dark mode, SF Pro typography.` }];
+    
+    if (attachments && attachments.length > 0) {
+      attachments.forEach(att => {
+        parts.push({
+          inlineData: {
+            mimeType: att.mimeType || "image/png",
+            data: att.data.split(",")[1]
+          }
+        });
+      });
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-image',
+      contents: [{ parts }],
+      config: {
+        imageConfig: { aspectRatio: "9:16" }
+      }
+    });
+    
+    for (const part of response.candidates[0].content.parts) {
+      if (part.inlineData) {
+        return `data:image/png;base64,${part.inlineData.data}`;
+      }
+    }
+  } catch (e) {
+    console.error("Image generation failed:", e);
+  }
+  return null;
+};
+
 /* ── Parse code blocks into files ─────────────────────────── */
 const parseFiles = (text: string) => {
   const files: Record<string, any> = {};
-  const blockRegex = /```(\w+)(?:\s+([^\n]+))?\n([\s\S]*?)```/g;
+  
+  // Support both Markdown blocks and <file> tags
+  const blockRegex = /```(\w+)(?:\s+([^\n]+))?\n([\s\S]*?)(?:```|$)/g;
+  const tagRegex = /<file name="([^"]+)">([\s\S]*?)(?:<\/file>|$)/g;
+  
   let m;
   while ((m = blockRegex.exec(text)) !== null) {
     const lang = m[1];
     let filename = m[2]?.trim();
     const content = m[3];
     if (!filename) {
-      const extMap: Record<string, string> = { jsx:"App.jsx", tsx:"App.tsx", js:"index.js", ts:"index.ts", html:"index.html", css:"styles.css", json:"package.json", sh:"setup.sh", bash:"setup.sh", py:"main.py", sql:"schema.sql", yaml:"config.yaml", yml:"config.yml", md:"README.md" };
+      const extMap: Record<string, string> = { jsx:"App.jsx", tsx:"App.tsx", js:"index.js", ts:"index.ts", html:"index.html", css:"styles.css", json:"package.json", md:"README.md" };
       filename = extMap[lang] || `file.${lang}`;
-    }
-    if (files[filename]) {
-      let i = 2;
-      while (files[`${filename}(${i})`]) i++;
-      filename = `${filename}(${i})`;
     }
     files[filename] = { name: filename, lang, content };
   }
+
+  while ((m = tagRegex.exec(text)) !== null) {
+    const filename = m[1];
+    const content = m[2];
+    const lang = filename.split(".").pop() || "js";
+    files[filename] = { name: filename, lang, content };
+  }
+
   if (!Object.keys(files).length && text.trim()) {
     files["response.md"] = { name: "response.md", lang: "md", content: text };
   }
@@ -129,51 +254,220 @@ const highlight = (code: string, lang: string) => {
   if (!code) return "";
   const esc = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const jsLangs = new Set(["jsx", "tsx", "js", "ts", "javascript", "typescript"]);
+  
+  let highlighted = esc;
+  
   if (jsLangs.has(lang)) {
-    return esc
+    highlighted = esc
       .replace(/(\/\/[^\n]*)/g, '<span style="color:#6A9955">$1</span>')
       .replace(/(\/\*[\s\S]*?\*\/)/g, '<span style="color:#6A9955">$1</span>')
       .replace(/\b(import|export|from|const|let|var|function|return|if|else|for|while|class|extends|new|async|await|try|catch|throw|typeof|instanceof|default|null|undefined|true|false|void)\b/g, '<span style="color:#569CD6">$1</span>')
       .replace(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, '<span style="color:#CE9178">$1</span>')
       .replace(/\b(\d+\.?\d*)\b/g, '<span style="color:#B5CEA8">$1</span>');
-  }
-  if (lang === "html") {
-    return esc
+  } else if (lang === "html") {
+    highlighted = esc
       .replace(/(&lt;\/?[\w-]+)/g, '<span style="color:#569CD6">$1</span>')
       .replace(/([\w-]+=)("[^"]*")/g, '<span style="color:#9CDCFE">$1</span><span style="color:#CE9178">$2</span>');
-  }
-  if (lang === "css") {
-    return esc
+  } else if (lang === "css") {
+    highlighted = esc
+      .replace(/([^{}\n]+)\s*\{/g, '<span style="color:#D7BA7D">$1</span> {')
       .replace(/([\w-]+)\s*:/g, '<span style="color:#9CDCFE">$1</span>:')
-      .replace(/(#[0-9a-fA-F]{3,8})/g, '<span style="color:#CE9178">$1</span>');
+      .replace(/:\s*([^;{}]+)/g, ': <span style="color:#CE9178">$1</span>')
+      .replace(/(\/\*[\s\S]*?\*\/)/g, '<span style="color:#6A9955">$1</span>');
+  } else if (lang === "json") {
+    highlighted = esc
+      .replace(/("(?:[^"\\]|\\.)*")\s*:/g, '<span style="color:#9CDCFE">$1</span>:')
+      .replace(/:\s*("(?:[^"\\]|\\.)*"|true|false|null|\d+\.?\d*)/g, ': <span style="color:#CE9178">$1</span>');
   }
-  return esc;
+
+  return highlighted.split("\n").map((line, i) => 
+    `<div class="code-line" data-line="${i + 1}">${line || " "}</div>`
+  ).join("");
+};
+
+/* ── Code Editor Component ─────────────────────────────────── */
+const CodeEditor = ({ code, lang, onChange }: { code: string, lang: string, onChange: (val: string) => void }) => {
+  const [val, setVal] = useState(code);
+  const preRef = useRef<HTMLPreElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    setVal(code);
+  }, [code]);
+
+  const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
+    if (preRef.current) {
+      preRef.current.scrollTop = e.currentTarget.scrollTop;
+      preRef.current.scrollLeft = e.currentTarget.scrollLeft;
+    }
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const v = e.target.value;
+    setVal(v);
+    onChange(v);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Basic autocompletion/indentation
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const start = e.currentTarget.selectionStart;
+      const end = e.currentTarget.selectionEnd;
+      const newValue = val.substring(0, start) + "  " + val.substring(end);
+      setVal(newValue);
+      onChange(newValue);
+      setTimeout(() => {
+        if (textareaRef.current) {
+          textareaRef.current.selectionStart = textareaRef.current.selectionEnd = start + 2;
+        }
+      }, 0);
+    }
+    
+    // Basic bracket completion
+    const pairs: Record<string, string> = { "(": ")", "{": "}", "[": "]", '"': '"', "'": "'" };
+    if (pairs[e.key]) {
+      const start = e.currentTarget.selectionStart;
+      const end = e.currentTarget.selectionEnd;
+      // Only complete if at end of line or before space
+      const nextChar = val[start] || "";
+      if (nextChar === "" || /\s|\n|\)|\]|\}/.test(nextChar)) {
+        e.preventDefault();
+        const newValue = val.substring(0, start) + e.key + pairs[e.key] + val.substring(end);
+        setVal(newValue);
+        onChange(newValue);
+        setTimeout(() => {
+          if (textareaRef.current) {
+            textareaRef.current.selectionStart = textareaRef.current.selectionEnd = start + 1;
+          }
+        }, 0);
+      }
+    }
+  };
+
+  return (
+    <div style={{ position: "relative", flex: 1, height: "100%", overflow: "hidden", background: "#0A0A0D" }}>
+      <textarea
+        ref={textareaRef}
+        value={val}
+        onChange={handleChange}
+        onScroll={handleScroll}
+        onKeyDown={handleKeyDown}
+        spellCheck={false}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          padding: "14px 18px 14px 50px",
+          fontFamily: "Geist Mono, monospace",
+          fontSize: "12.5px",
+          lineHeight: "1.7",
+          color: "transparent",
+          background: "transparent",
+          caretColor: "#F59E0B",
+          resize: "none",
+          border: "none",
+          outline: "none",
+          whiteSpace: "pre",
+          overflow: "auto",
+          zIndex: 1,
+        }}
+      />
+      <pre
+        ref={preRef}
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          padding: "14px 18px 14px 50px",
+          fontFamily: "Geist Mono, monospace",
+          fontSize: "12.5px",
+          lineHeight: "1.7",
+          color: "#C8D3F5",
+          background: "#0A0A0D",
+          margin: 0,
+          pointerEvents: "none",
+          whiteSpace: "pre",
+          overflow: "hidden",
+        }}
+        dangerouslySetInnerHTML={{ __html: highlight(val, lang) }}
+      />
+    </div>
+  );
 };
 
 /* ── Build preview HTML ─────────────────────────────────────── */
 const buildPreviewHTML = (files: Record<string, any>) => {
-  const htmlFile = Object.values(files).find(f => f.lang === "html");
-  const cssFile = Object.values(files).find(f => f.lang === "css" || f.name.endsWith(".css"));
-  const jsFile = Object.values(files).find(f => ["js","jsx","ts","tsx"].includes(f.lang));
+  const htmlFile = Object.values(files).find(f => f.lang === "html" || f.name === "index.html");
+  const cssFiles = Object.values(files).filter(f => f.lang === "css" || f.name.endsWith(".css"));
+  const jsFiles = Object.values(files).filter(f => ["js","jsx","ts","tsx"].includes(f.lang) || f.name.endsWith(".js") || f.name.endsWith(".jsx"));
 
+  const cssContent = cssFiles.map(f => f.content).join("\n");
+  
   if (htmlFile) {
     let html = htmlFile.content;
-    if (cssFile) html = html.replace("</head>", `<style>${cssFile.content}</style></head>`);
-    if (jsFile && !htmlFile.content.includes("<script")) {
-      html = html.replace("</body>", `<script>${jsFile.content}</script></body>`);
+    if (cssContent) html = html.replace("</head>", `<style>${cssContent}</style></head>`);
+    
+    // Simple script injection for the first JS file if not present
+    if (jsFiles.length > 0 && !html.includes("<script")) {
+      html = html.replace("</body>", `<script>${jsFiles[0].content}</script></body>`);
     }
     return html;
   }
 
-  if (jsFile && ["jsx","tsx"].includes(jsFile.lang)) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><script src="https://unpkg.com/react@18/umd/react.development.js"></script><script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script><script src="https://unpkg.com/@babel/standalone/babel.min.js"></script><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0C0C0F;color:#E8E6E1}</style></head><body><div id="root"></div><script type="text/babel">${jsFile.content.replace(/<\/script>/g,"<\\/script>")}\nconst __RootComponent = typeof App !== 'undefined' ? App : (typeof default_1 !== 'undefined' ? default_1 : () => React.createElement('div',{style:{padding:20,color:'#F59E0B',fontFamily:'system-ui'}},'✅ Component generated — deploy to Vercel for full preview'));\nReactDOM.createRoot(document.getElementById('root')).render(React.createElement(__RootComponent));</script></body></html>`;
+  // React Multi-file Support (Experimental)
+  if (jsFiles.length > 0) {
+    const mainFile = jsFiles.find(f => f.name.includes("App") || f.name.includes("index")) || jsFiles[0];
+    const otherFiles = jsFiles.filter(f => f !== mainFile);
+    
+    const scripts = otherFiles.map(f => `
+      // File: ${f.name}
+      (function() {
+        const exports = {};
+        const module = { exports };
+        ${f.content}
+        window["${f.name}"] = module.exports;
+      })();
+    `).join("\n");
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://unpkg.com/framer-motion@10.16.4/dist/framer-motion.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #000; color: #fff; margin: 0; font-family: system-ui; }
+    ${cssContent}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    ${scripts}
+    
+    // Main Entry: ${mainFile.name}
+    (function() {
+      ${mainFile.content}
+      const Root = typeof App !== 'undefined' ? App : (typeof default_1 !== 'undefined' ? default_1 : () => <div>Component Ready</div>);
+      ReactDOM.createRoot(document.getElementById('root')).render(<Root />);
+    })();
+  </script>
+</body>
+</html>`;
   }
 
-  if (jsFile) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;background:#0C0C0F;color:#E8E6E1;padding:20px}pre{background:#111;padding:16px;border-radius:8px;white-space:pre-wrap;font-size:13px;color:#C8D3F5;border:1px solid #1A1A22}</style></head><body><pre>${jsFile.content.replace(/</g,"&lt;")}</pre></body></html>`;
-  }
-
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;background:#0C0C0F;color:#E8E6E1;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:12px}</style></head><body><div style="font-size:32px">⚡</div><div style="font-size:16px;font-weight:700;color:#F59E0B">SAL Builder Ready</div><div style="font-size:13px;color:#555">Describe what you want to build in the chat</div></body></html>`;
+  return `<!DOCTYPE html><html><head><style>body{background:#000;color:#F59E0B;display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui}</style></head><body><div>Describe your app to start building...</div></body></html>`;
 };
 
 /* ── System Prompt for Builder ──────────────────────────────── */
@@ -243,6 +537,13 @@ const ChatMsg = ({ msg }: any) => {
       </div>
       <div className={`ios-bubble ${isUser ? "ios-bubble-user" : "ios-bubble-assistant"}`} style={{ boxShadow: isUser ? "0 4px 12px rgba(245, 158, 11, 0.2)" : "0 4px 12px rgba(0,0,0,0.3)" }}>
         <div style={{ fontSize: 13.5, lineHeight: 1.5 }} className={msg.streaming ? "cursor" : ""}>
+          {msg.attachments && msg.attachments.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+              {msg.attachments.map((att: any, idx: number) => (
+                <img key={idx} src={att.data} alt={att.name} style={{ maxWidth: "100%", maxHeight: 200, borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)" }} />
+              ))}
+            </div>
+          )}
           {isUser ? <span style={{ whiteSpace: "pre-wrap" }}>{msg.content}</span> : renderText(msg.content)}
           {msg.streaming && !msg.content && (
             <span style={{ display: "inline-flex", gap: 4 }}>
@@ -294,29 +595,97 @@ const FileNode = ({ name, node, depth = 0, activeFile, onSelect, path = "" }: an
 /* ══════════════════════════════════════════════════════════════
    BUILDER IDE — main component
 ══════════════════════════════════════════════════════════════ */
-export default function App() {
+/* ── AI Tools Panel ────────────────────────────────────────── */
+const AITools = () => {
+  const tools = [
+    { id: 'live', name: 'Live Audio', icon: <Mic size={18} />, desc: 'Gemini 2.5 Native Audio conversation', model: 'gemini-2.5-flash-native-audio-preview-09-2025' },
+    { id: 'veo', name: 'Veo Video', icon: <Video size={18} />, desc: 'Prompt-based video generation', model: 'veo-3.1-fast-generate-preview' },
+    { id: 'search', name: 'Search Grounding', icon: <Search size={18} />, desc: 'Real-time web data integration', model: 'gemini-3-flash-preview' },
+    { id: 'maps', name: 'Maps Grounding', icon: <MapPin size={18} />, desc: 'Location and place intelligence', model: 'gemini-2.5-flash' },
+    { id: 'image', name: 'Nano Banana Pro', icon: <ImageIcon size={18} />, desc: 'High-fidelity image generation', model: 'gemini-3-pro-image-preview' },
+    { id: 'thinking', name: 'Thinking Mode', icon: <BrainCircuit size={18} />, desc: 'Complex reasoning for hard tasks', model: 'gemini-3.1-pro-preview' },
+    { id: 'vision', name: 'Image Analysis', icon: <Eye size={18} />, desc: 'Analyze and understand images', model: 'gemini-3.1-pro-preview' },
+  ];
+
+  return (
+    <div style={{ padding: 20, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 16 }}>
+      {tools.map(tool => (
+        <motion.div key={tool.id} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}
+          style={{ background: "#0D0D10", border: "1px solid #1A1A22", borderRadius: 12, padding: 20, cursor: "pointer", transition: "all 0.2s" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+            <div style={{ width: 36, height: 36, borderRadius: 8, background: "#1A1A22", display: "flex", alignItems: "center", justifyContent: "center", color: "#F59E0B" }}>
+              {tool.icon}
+            </div>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#E8E6E1" }}>{tool.name}</div>
+              <div style={{ fontSize: 10, color: "#F59E0B", fontWeight: 600 }}>{tool.model}</div>
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: "#555", lineHeight: 1.5, marginBottom: 16 }}>{tool.desc}</div>
+          <button style={{ width: "100%", padding: "8px", borderRadius: 6, background: "#1A1A22", color: "#AAA", border: "none", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+            Configure Tool
+          </button>
+        </motion.div>
+      ))}
+    </div>
+  );
+};
+
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+function App() {
+  // Auth state
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
   // Chat state
   const [msgs, setMsgs] = useState<any[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
 
-  // Load initial messages and setup WebSocket
+  // Auth Listener
   useEffect(() => {
-    fetch("/api/messages")
-      .then(res => res.json())
-      .then(data => {
-        setMsgs(data.map((m: any) => ({
-          role: m.sender === "user" ? "user" : "assistant",
-          content: m.text,
-          timestamp: m.timestamp
-        })));
-      });
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setIsAuthReady(true);
+      if (u) {
+        // Sync user profile to Firestore
+        setDoc(doc(db, 'users', u.uid), {
+          uid: u.uid,
+          email: u.email,
+          displayName: u.displayName,
+          photoURL: u.photoURL,
+          updatedAt: serverTimestamp()
+        }, { merge: true }).catch(e => handleFirestoreError(e, OperationType.WRITE, `users/${u.uid}`));
+      }
+    });
+    return unsub;
+  }, []);
 
-    fetch("/api/projects")
-      .then(res => res.json())
-      .then(data => setProjects(data));
+  // Load projects from Firestore
+  useEffect(() => {
+    if (!user) {
+      setProjects([]);
+      return;
+    }
+    const q = query(collection(db, 'projects'), where('ownerId', '==', user.uid), orderBy('updatedAt', 'desc'), limit(20));
+    const unsub = onSnapshot(q, (snapshot) => {
+      const projs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProjects(projs);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'projects'));
+    return unsub;
+  }, [user]);
 
+  // WebSocket sync (optional now that we have Firestore, but keeping for real-time chat if needed)
+  useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(`${protocol}//${window.location.host}`);
     socketRef.current = socket;
@@ -325,7 +694,6 @@ export default function App() {
       const message = JSON.parse(event.data);
       if (message.type === "chat") {
         const payload = message.payload;
-        // Only add if it's from another client or we need to sync
         setMsgs(prev => {
           if (prev.find(m => m.id === payload.id)) return prev;
           return [...prev, {
@@ -358,32 +726,277 @@ export default function App() {
   const [projects, setProjects] = useState<any[]>([]);
   const [showProjects, setShowProjects] = useState(false);
 
-  // Save project to DB
+  // Mobile state
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [mobileTab, setMobileTab] = useState<'chat' | 'ide'>('chat');
+  const [showSplash, setShowSplash] = useState(true);
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [viewMode, setViewMode] = useState<'prep' | 'studio'>('prep');
+  const [concepts, setConcepts] = useState<string[]>([]);
+  const [isGeneratingConcept, setIsGeneratingConcept] = useState(false);
+  const [attachments, setAttachments] = useState<any[]>([]);
+  const [isListening, setIsListening] = useState(false);
+  const [versions, setVersions] = useState<any[]>([]);
+  const [githubConnected, setGithubConnected] = useState(false);
+  const [isPushing, setIsPushing] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Smart Keyboard Handling for PWA
+  useEffect(() => {
+    if (!window.visualViewport) return;
+    const handleVisualViewportResize = () => {
+      if (containerRef.current) {
+        containerRef.current.style.height = `${window.visualViewport!.height}px`;
+        window.scrollTo(0, 0);
+      }
+    };
+    window.visualViewport.addEventListener('resize', handleVisualViewportResize);
+    return () => window.visualViewport?.removeEventListener('resize', handleVisualViewportResize);
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handleResize);
+    
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    });
+
+    const timer = setTimeout(() => setShowSplash(false), 2500);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      clearTimeout(timer);
+    };
+  }, []);
+
+  const installPWA = () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    deferredPrompt.userChoice.then((choiceResult: any) => {
+      if (choiceResult.outcome === 'accepted') {
+        console.log('User accepted the install prompt');
+      }
+      setDeferredPrompt(null);
+    });
+  };
+
+  const vibrate = (pattern = [10]) => {
+    if ('vibrate' in navigator) {
+      navigator.vibrate(pattern);
+    }
+  };
+
+  const startSpeechToText = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Speech recognition is not supported in this browser.");
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-US';
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setIsListening(true);
+      vibrate([30]);
+    };
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setInput(prev => prev + (prev ? " " : "") + transcript);
+    };
+    recognition.onerror = (event: any) => {
+      console.error("Speech recognition error:", event.error);
+      setIsListening(false);
+    };
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+    recognition.start();
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+    Array.from(files).forEach((file: any) => {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        setAttachments(prev => [...prev, { data: ev.target?.result, name: file.name, mimeType: file.type }]);
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf("image") !== -1) {
+        const blob = items[i].getAsFile();
+        if (blob) {
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            setAttachments(prev => [...prev, { data: ev.target?.result, name: "pasted-image.png", mimeType: "image/png" }]);
+          };
+          reader.readAsDataURL(blob as Blob);
+        }
+      }
+    }
+  };
+
+  // Save project to Firestore
   const saveProject = useCallback(async (name: string, config: any) => {
+    if (!user) {
+      alert("Please sign in to save your project.");
+      return;
+    }
+    const projectId = projectName === "Untitled Project" ? `proj_${Date.now()}` : projectName.replace(/\s+/g, '-').toLowerCase();
     try {
-      const res = await fetch("/api/projects", {
+      await setDoc(doc(db, 'projects', projectId), {
+        id: projectId,
+        name,
+        ownerId: user.uid,
+        files: config,
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp()
+      }, { merge: true });
+      setProjectName(name);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `projects/${projectId}`);
+    }
+  }, [user, projectName]);
+
+  const saveVersion = useCallback(async (projectId: string, files: any, label?: string) => {
+    if (!user) return;
+    const versionId = `v_${Date.now()}`;
+    try {
+      await setDoc(doc(db, 'projects', projectId, 'versions', versionId), {
+        id: versionId,
+        files,
+        createdAt: serverTimestamp(),
+        label: label || `Auto-save ${new Date().toLocaleTimeString()}`
+      });
+    } catch (e) {
+      console.error("Failed to save version:", e);
+    }
+  }, [user]);
+
+  const restoreVersion = (version: any) => {
+    setFiles(version.files);
+    const first = Object.values(version.files)[0];
+    setActiveFile(first);
+    setOpenTabs(Object.values(version.files).slice(0, 5));
+    setPreviewKey(k => k + 1);
+    vibrate([30, 10, 30]);
+    setBuildLogs(prev => [...prev, `Restored version: ${version.label}`]);
+    setBuildStep("Version Restored");
+    setTimeout(() => setBuildStep(""), 3000);
+  };
+
+  const downloadProject = async () => {
+    const zip = new JSZip();
+    Object.entries(files).forEach(([path, content]) => {
+      zip.file(path, content as string);
+    });
+    const blob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${projectName || "saintsal-project"}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const connectGitHub = async () => {
+    const res = await fetch("/api/auth/github");
+    const { url } = await res.json();
+    window.open(url, "github_auth", "width=600,height=700");
+  };
+
+  const pushToGitHub = async () => {
+    if (!githubConnected) return connectGitHub();
+    setIsPushing(true);
+    try {
+      const res = await fetch("/api/github/push", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, config })
+        body: JSON.stringify({
+          repoName: projectName.replace(/\s+/g, '-').toLowerCase(),
+          files,
+          description: "Built with SaintSal™ Studio"
+        })
       });
-      const newProj = await res.json();
-      setProjects(prev => [newProj, ...prev]);
-    } catch (e) {
-      console.error("Failed to save project", e);
+      const data = await res.json();
+      if (data.success) {
+        alert(`Successfully pushed to GitHub: ${data.url}`);
+      } else {
+        throw new Error(data.error);
+      }
+    } catch (e: any) {
+      alert(`Push failed: ${e.message}`);
+    } finally {
+      setIsPushing(false);
     }
+  };
+
+  useEffect(() => {
+    const handleMsg = (e: MessageEvent) => {
+      if (e.data?.type === 'GITHUB_AUTH_SUCCESS') {
+        setGithubConnected(true);
+      }
+    };
+    window.addEventListener('message', handleMsg);
+    
+    // Check GitHub status
+    fetch("/api/auth/github/status").then(r => r.json()).then(d => setGithubConnected(d.connected));
+    
+    return () => window.removeEventListener('message', handleMsg);
   }, []);
+
+  useEffect(() => {
+    if (!user || !projectName || projectName === "Untitled Project") return;
+    const projectId = projectName.replace(/\s+/g, '-').toLowerCase();
+    const q = query(collection(db, 'projects', projectId, 'versions'), orderBy('createdAt', 'desc'), limit(20));
+    return onSnapshot(q, (snap) => {
+      setVersions(snap.docs.map(d => d.data()));
+    });
+  }, [user, projectName]);
 
   // Panel width (resizable)
   const [leftWidth, setLeftWidth] = useState(42); // percent
   const resizing = useRef(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-
+  
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+
   useEffect(() => {
-    if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
-  }, [msgs]);
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 100;
+      setShowScrollBottom(!isAtBottom);
+    };
+    el.addEventListener("scroll", onScroll);
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const scrollToBottom = useCallback((smooth = true) => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTo({
+        top: chatScrollRef.current.scrollHeight,
+        behavior: smooth ? "smooth" : "auto"
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    scrollToBottom(msgs.length > 1);
+  }, [msgs, scrollToBottom]);
 
   // Resizer drag
   useEffect(() => {
@@ -401,47 +1014,91 @@ export default function App() {
 
   const [isBuilding, setIsBuilding] = useState(false);
   const [buildStep, setBuildStep] = useState("");
+  const [buildLogs, setBuildLogs] = useState<string[]>([]);
+  const [isPublishing, setIsPublishing] = useState(false);
 
   const send = useCallback(async (text: string) => {
-    if (!text?.trim() || streaming) return;
+    if ((!text?.trim() && attachments.length === 0) || streaming) return;
     setIsBuilding(true);
-    setBuildStep("Initializing build engine...");
+    vibrate([20, 10, 20]);
+    
+    const currentAttachments = [...attachments];
+    setAttachments([]);
+
+    if (viewMode === 'prep') {
+      setIsGeneratingConcept(true);
+      const concept = await generateConcept(text, currentAttachments);
+      if (concept) setConcepts(prev => [...prev, concept]);
+      setIsGeneratingConcept(false);
+    }
+
+    setBuildLogs(["Initializing SaintSal™ Build Engine...", "Connecting to HACP Protocol..."]);
+    setBuildStep("Initializing...");
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
     
-    const uMsg = { role: "user", content: text };
+    const uMsg = { role: "user", content: text, attachments: currentAttachments };
     
     // Send to server via WebSocket
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({
         type: "chat",
         text: text,
-        sender: "user"
+        sender: "user",
+        attachments: currentAttachments
       }));
     }
 
     const allMsgs = [...msgs, uMsg];
-    setMsgs([...allMsgs, { role: "assistant", content: "", streaming: true }]);
+    setMsgs([...allMsgs, { role: "assistant", content: "Thinking...", streaming: true }]);
     setStreaming(true);
     let fullResp = "";
+    let lastParsedCount = 0;
+
     await salStream(
-      allMsgs.map(m => ({ role: m.role, content: m.content })),
+      allMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
       BUILDER_SYS,
       chunk => {
+        if (fullResp === "") {
+          // Clear "Thinking..." on first real chunk
+          setMsgs(prev => { const c = [...prev]; c[c.length - 1] = { ...c[c.length - 1], content: chunk }; return c; });
+        } else {
+          setMsgs(prev => { const c = [...prev]; c[c.length - 1] = { ...c[c.length - 1], content: fullResp + chunk }; return c; });
+        }
         fullResp += chunk;
-        setMsgs(prev => { const c = [...prev]; c[c.length - 1] = { ...c[c.length - 1], content: fullResp }; return c; });
         
+        // Real-time file parsing - update content of existing files for live typing feel
+        const parsed = parseFiles(fullResp);
+        setFiles(prev => {
+          const updated = { ...prev };
+          Object.entries(parsed).forEach(([path, file]) => {
+            updated[path] = file;
+          });
+          return updated;
+        });
+
+        const parsedCount = Object.keys(parsed).length;
+        if (parsedCount > lastParsedCount) {
+          const newFiles = Object.keys(parsed).filter(k => !files[k]);
+          newFiles.forEach(f => {
+            setBuildLogs(prev => [...prev, `Successfully orchestrated ${f}`]);
+          });
+          lastParsedCount = parsedCount;
+        }
+
         // Update build step based on content
-        if (fullResp.includes("<file")) {
-          const match = fullResp.match(/<file name="([^"]+)">/g);
+        if (fullResp.includes("<file") || fullResp.includes("```")) {
+          const match = fullResp.match(/<file name="([^"]+)">/g) || fullResp.match(/```\w+\s+([^\n]+)/g);
           if (match) {
-            const lastFile = match[match.length - 1].match(/"([^"]+)"/)?.[1];
-            setBuildStep(`Generating ${lastFile}...`);
+            const lastMatch = match[match.length - 1];
+            const name = lastMatch.includes("<file") ? lastMatch.match(/"([^"]+)"/)?.[1] : lastMatch.split(" ")[1];
+            if (name) setBuildStep(`Building ${name}...`);
           }
         }
       },
       () => {
         setIsBuilding(false);
+        setBuildLogs(prev => [...prev, "Build completed successfully.", "App is ready for preview."]);
         setMsgs(prev => { const c = [...prev]; c[c.length - 1] = { ...c[c.length - 1], streaming: false }; return c; });
         
         // Save assistant response to server
@@ -460,17 +1117,19 @@ export default function App() {
           setActiveFile(first);
           setOpenTabs(Object.values(parsed).slice(0, 5));
           setPreviewKey(k => k + 1);
-          setRightTab("preview");
+          setRightTab("simulator");
           
           // Auto-save project
           const name = text.slice(0, 30) + (text.length > 30 ? "..." : "");
           setProjectName(name);
+          const projectId = name.replace(/\s+/g, '-').toLowerCase();
           saveProject(name, parsed);
+          saveVersion(projectId, parsed);
         }
         setStreaming(false);
       }
     );
-  }, [msgs, streaming]);
+  }, [msgs, streaming, files, attachments, viewMode, saveVersion, saveProject]);
 
   const openFile = (file: any) => {
     setActiveFile(file);
@@ -497,10 +1156,90 @@ export default function App() {
     "Build a wellness app with audio player, session tracking, and a serene UI.",
   ];
 
+  const handlePublish = async () => {
+    setIsPublishing(true);
+    await new Promise(r => setTimeout(r, 2000));
+    await saveProject(projectName, files);
+    setIsPublishing(false);
+    alert("Project published to SaintSal™ Cloud!");
+  };
+
   return (
-    <div ref={containerRef} style={{ display: "flex", height: "100vh", background: "#000", overflow: "hidden", color: "#E8E6E1", fontFamily: "Geist, sans-serif" }}>
-      
-      {isAppMode ? (
+    <div ref={containerRef} style={{ 
+      display: "flex", 
+      height: "100vh", 
+      background: "#000", 
+      overflow: "hidden", 
+      color: "#E8E6E1", 
+      fontFamily: "Geist, sans-serif",
+      flexDirection: isMobile ? "column" : "row",
+      position: "relative"
+    }}>
+      <AnimatePresence>
+        {showSplash && (
+          <motion.div 
+            key="splash"
+            initial={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            style={{ 
+              position: "fixed", 
+              inset: 0, 
+              background: "#000", 
+              zIndex: 9999, 
+              display: "flex", 
+              flexDirection: "column", 
+              alignItems: "center", 
+              justifyContent: "center" 
+            }}
+          >
+            <motion.div 
+              initial={{ scale: 0.8, opacity: 0 }} 
+              animate={{ scale: 1, opacity: 1 }} 
+              transition={{ duration: 0.8, ease: "easeOut" }}
+              style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 20 }}
+            >
+              <div style={{ width: 80, height: 80, borderRadius: 20, background: "linear-gradient(135deg,#F59E0B,#D97706)", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 20px 40px rgba(245,158,11,0.2)" }}>
+                <Sparkles size={40} color="#000" />
+              </div>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 24, fontWeight: 900, letterSpacing: "-0.04em", color: "#E8E6E1" }}>SaintSal™ <span style={{ color: "#F59E0B" }}>Studio</span></div>
+                <div style={{ fontSize: 12, color: "#444", marginTop: 4, letterSpacing: "0.1em", textTransform: "uppercase" }}>AI-Powered iOS Builder</div>
+              </div>
+            </motion.div>
+            <div style={{ position: "absolute", bottom: 40, width: 120, height: 2, background: "#111", borderRadius: 1, overflow: "hidden" }}>
+              <motion.div 
+                initial={{ x: "-100%" }} 
+                animate={{ x: "100%" }} 
+                transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }} 
+                style={{ width: "100%", height: "100%", background: "#F59E0B" }} 
+              />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {viewMode === 'prep' ? (
+        <PrepView 
+          msgs={msgs} 
+          input={input} 
+          setInput={setInput} 
+          send={send} 
+          streaming={streaming} 
+          concepts={concepts} 
+          isGeneratingConcept={isGeneratingConcept} 
+          onStartBuild={() => setViewMode('studio')}
+          user={user}
+          signInWithGoogle={signInWithGoogle}
+          logOut={logOut}
+          isMobile={isMobile}
+          attachments={attachments}
+          setAttachments={setAttachments}
+          handleFileSelect={handleFileSelect}
+          handlePaste={handlePaste}
+          startSpeechToText={startSpeechToText}
+          isListening={isListening}
+        />
+      ) : isAppMode ? (
         <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#000" }}>
           <div style={{ height: 44, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px", background: "rgba(0,0,0,0.8)", backdropFilter: "blur(20px)", borderBottom: "1px solid #111", zIndex: 100 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -523,43 +1262,166 @@ export default function App() {
           {/* ══════════════════════════════════════
               LEFT PANEL — SAL Chat
           ══════════════════════════════════════ */}
-          <div style={{ width: `${leftWidth}%`, display: "flex", flexDirection: "column", borderRight: "1px solid #141420", background: "#0A0A0D" }}>
-            {/* Build Progress Overlay */}
-        <AnimatePresence>
-          {isBuilding && streaming && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.85)", backdropFilter: "blur(10px)", zIndex: 1000, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20 }}>
-              <div className="spinn" style={{ width: 40, height: 40, border: "3px solid #F59E0B22", borderTopColor: "#F59E0B", borderRadius: "50%" }} />
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 18, fontWeight: 800, color: "#F59E0B", marginBottom: 4 }}>Building SaintSal App</div>
-                <div className="mono" style={{ fontSize: 12, color: "#555" }}>{buildStep}</div>
+          <div style={{ 
+            width: isMobile ? "100%" : `${leftWidth}%`, 
+            display: isMobile && mobileTab !== 'chat' ? "none" : "flex", 
+            flexDirection: "column", 
+            borderRight: isMobile ? "none" : "1px solid #141420", 
+            background: "#0A0A0D",
+            height: isMobile ? "calc(100vh - 56px)" : "100%"
+          }}>
+            {/* History Panel */}
+            <AnimatePresence>
+              {showHistory && (
+            <motion.div initial={{ x: -300 }} animate={{ x: 0 }} exit={{ x: -300 }}
+              style={{ position: "absolute", top: 56, left: 0, bottom: 0, width: 300, background: "#08080A", borderRight: "1px solid #141420", zIndex: 100, display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: 20, borderBottom: "1px solid #141420", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <RefreshCw size={16} color="#F59E0B" />
+                  <span style={{ fontWeight: 800, fontSize: 14 }}>Version History</span>
+                </div>
+                <button onClick={() => setShowHistory(false)} style={{ background: "transparent", border: "none", cursor: "pointer" }}><X size={16} color="#444" /></button>
               </div>
-              <div style={{ width: 200, height: 4, background: "#111", borderRadius: 2, overflow: "hidden" }}>
-                <motion.div initial={{ width: 0 }} animate={{ width: "100%" }} transition={{ duration: 15, ease: "linear" }} style={{ height: "100%", background: "#F59E0B" }} />
+              <div style={{ flex: 1, overflowY: "auto", padding: 10 }}>
+                {versions.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 40, color: "#444", fontSize: 12 }}>No versions yet. Build to save snapshots.</div>
+                ) : (
+                  versions.map((v, i) => (
+                    <div key={v.id} onClick={() => restoreVersion(v)}
+                      style={{ padding: 12, borderRadius: 8, background: "#111", border: "1px solid #1A1A22", marginBottom: 8, cursor: "pointer", transition: "all 0.2s" }}
+                      className="hover-scale">
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                        {v.label.includes("Manual") ? <Save size={10} color="#F59E0B" /> : <RefreshCw size={10} color="#555" />}
+                        <div style={{ fontSize: 12, fontWeight: 700, color: "#E8E6E1" }}>{v.label}</div>
+                      </div>
+                      <div style={{ fontSize: 10, color: "#555" }}>{v.createdAt?.toDate ? v.createdAt.toDate().toLocaleString() : "Just now"}</div>
+                    </div>
+                  ))
+                )}
               </div>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* Header */}
-            <div style={{ height: 44, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", borderBottom: "1px solid #141420", flexShrink: 0, position: "relative" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-                <div style={{ width: 26, height: 26, borderRadius: 6, background: "linear-gradient(135deg,#F59E0B,#D97706)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  <span style={{ fontSize: 11, fontWeight: 900, color: "#000" }}>S</span>
+            {/* Settings Panel */}
+            <AnimatePresence>
+              {showSettings && (
+            <motion.div initial={{ x: -300 }} animate={{ x: 0 }} exit={{ x: -300 }}
+              style={{ position: "absolute", top: 56, left: 0, bottom: 0, width: 300, background: "#08080A", borderRight: "1px solid #141420", zIndex: 100, display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: 20, borderBottom: "1px solid #141420", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Settings size={16} color="#F59E0B" />
+                  <span style={{ fontWeight: 800, fontSize: 14 }}>Project Settings</span>
                 </div>
-                <button onClick={() => setShowProjects(!showProjects)} style={{ background: "transparent", border: "none", cursor: "pointer", textAlign: "left", padding: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    <span style={{ fontSize: 12.5, fontWeight: 800, color: "#F59E0B" }}>{projectName}</span>
-                    <ChevronDown size={12} color="#444" />
+                <button onClick={() => setShowSettings(false)} style={{ background: "transparent", border: "none", cursor: "pointer" }}><X size={16} color="#444" /></button>
+              </div>
+              <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 24 }}>
+                {/* GitHub Section */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: "#555", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>Deployment</div>
+                  <div style={{ background: "#111", borderRadius: 12, border: "1px solid #1A1A22", padding: 16 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                      <Github size={20} color={githubConnected ? "#F59E0B" : "#444"} />
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 700 }}>GitHub</div>
+                        <div style={{ fontSize: 11, color: "#555" }}>{githubConnected ? "Connected" : "Not connected"}</div>
+                      </div>
+                    </div>
+                    {!githubConnected ? (
+                      <button onClick={connectGitHub} style={{ width: "100%", padding: "10px", borderRadius: 8, background: "#1A1A22", color: "#E8E6E1", border: "none", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Connect GitHub</button>
+                    ) : (
+                      <button onClick={pushToGitHub} disabled={isPushing}
+                        style={{ width: "100%", padding: "10px", borderRadius: 8, background: "#F59E0B", color: "#000", border: "none", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                        {isPushing ? <RefreshCw size={14} className="animate-spin" /> : <Zap size={14} fill="currentColor" />}
+                        Push to GitHub
+                      </button>
+                    )}
                   </div>
+                </div>
+
+                {/* Export Section */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: "#555", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>Export</div>
+                  <button onClick={downloadProject}
+                    style={{ width: "100%", padding: "12px", borderRadius: 12, background: "#111", border: "1px solid #1A1A22", color: "#E8E6E1", display: "flex", alignItems: "center", gap: 12, cursor: "pointer" }}>
+                    <Download size={18} color="#F59E0B" />
+                    <div style={{ textAlign: "left" }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>Download ZIP</div>
+                      <div style={{ fontSize: 11, color: "#555" }}>Full project source code</div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+            {/* Header */}
+            <div style={{ 
+              height: 56, 
+              display: "flex", 
+              alignItems: "center", 
+              justifyContent: "space-between", 
+              padding: isMobile ? "0 12px" : "0 20px", 
+              borderBottom: "1px solid #141420", 
+              flexShrink: 0, 
+              background: "#08080A", 
+              zIndex: 50 
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 8 : 16 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ width: 28, height: 28, borderRadius: 8, background: "linear-gradient(135deg,#F59E0B,#D97706)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <Sparkles size={16} color="#000" />
+                  </div>
+                  {!isMobile && <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em", color: "#E8E6E1" }}>SaintSal™ <span style={{ color: "#F59E0B" }}>Studio</span></span>}
+                </div>
+                {!isMobile && <div style={{ height: 20, width: 1, background: "#1A1A22" }}></div>}
+                <button onClick={() => setShowProjects(!showProjects)} style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+                  <Folder size={14} color="#555" />
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "#AAA", maxWidth: isMobile ? 80 : 150, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{projectName}</span>
+                  <ChevronDown size={12} color="#333" />
                 </button>
               </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={() => setIsAppMode(true)} style={{ padding: "4px 12px", borderRadius: 20, border: "1px solid #F59E0B", background: "transparent", color: "#F59E0B", fontSize: 11, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}>
-                  <Play size={11} fill="#F59E0B" /> Run App
+
+              <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 6 : 12 }}>
+                <button onClick={() => setShowHistory(!showHistory)} style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: showHistory ? "#F59E0B" : "#555" }}>
+                  <RefreshCw size={16} />
+                  {!isMobile && <span style={{ fontSize: 12, fontWeight: 600 }}>History</span>}
                 </button>
-                <button onClick={() => { setMsgs([]); setFiles({}); setActiveFile(null); setOpenTabs([]); setDeployStatus("idle"); setProjectName("Untitled Project"); }} style={{ padding: "4px 9px", borderRadius: 6, border: "1px solid #1E1E28", background: "transparent", color: "#555", fontSize: 11, cursor: "pointer", fontFamily: "Geist, sans-serif", display: "flex", alignItems: "center", gap: 4 }}>
-                  <Plus size={11} color="#555" />New
+                <button onClick={() => setShowSettings(!showSettings)} style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: showSettings ? "#F59E0B" : "#555" }}>
+                  <Settings size={16} />
+                  {!isMobile && <span style={{ fontSize: 12, fontWeight: 600 }}>Project</span>}
+                </button>
+                {isMobile && (
+                  <div style={{ display: "flex", background: "#111", borderRadius: 8, padding: 2, marginRight: 4 }}>
+                    <button onClick={() => setMobileTab('chat')} style={{ padding: "4px 10px", borderRadius: 6, background: mobileTab === 'chat' ? "#1A1A22" : "transparent", color: mobileTab === 'chat' ? "#F59E0B" : "#555", border: "none", fontSize: 10, fontWeight: 700 }}>CHAT</button>
+                    <button onClick={() => setMobileTab('ide')} style={{ padding: "4px 10px", borderRadius: 6, background: mobileTab === 'ide' ? "#1A1A22" : "transparent", color: mobileTab === 'ide' ? "#F59E0B" : "#555", border: "none", fontSize: 10, fontWeight: 700 }}>IDE</button>
+                  </div>
+                )}
+                {user ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <img src={user.photoURL || ""} alt={user.displayName || ""} style={{ width: 24, height: 24, borderRadius: "50%", border: "1px solid #1A1A22" }} />
+                    {!isMobile && <button onClick={logOut} style={{ background: "transparent", border: "none", color: "#555", fontSize: 11, cursor: "pointer" }}>Sign Out</button>}
+                  </div>
+                ) : (
+                  <button onClick={signInWithGoogle} style={{ background: "#1A1A22", color: "#AAA", border: "none", padding: "6px 10px", borderRadius: 6, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+                    Sign In
+                  </button>
+                )}
+                {!isMobile && (
+                  <>
+                    <button onClick={() => setIsAppMode(true)} style={{ display: "flex", alignItems: "center", gap: 8, background: "#1A1A22", color: "#fff", border: "none", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer", transition: "all 0.2s" }}>
+                      <Play size={14} fill="currentColor" />
+                      Run App
+                    </button>
+                    <button onClick={handlePublish} disabled={isPublishing} style={{ display: "flex", alignItems: "center", gap: 8, background: "linear-gradient(135deg,#F59E0B,#D97706)", color: "#000", border: "none", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: isPublishing ? 0.7 : 1 }}>
+                      {isPublishing ? <RefreshCw size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
+                      Publish
+                    </button>
+                  </>
+                )}
+                <button onClick={() => { setMsgs([]); setFiles({}); setActiveFile(null); setOpenTabs([]); setDeployStatus("idle"); setProjectName("Untitled Project"); }} style={{ width: 32, height: 32, borderRadius: 8, background: "#1A1A22", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                  <Plus size={16} color="#AAA" />
                 </button>
               </div>
 
@@ -598,7 +1460,21 @@ export default function App() {
         </div>
 
         {/* Chat area */}
-        <div ref={chatScrollRef} style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0" }}>
+        <div ref={chatScrollRef} style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0", position: "relative" }}>
+          {isBuilding && (
+            <div style={{ position: "sticky", top: 0, left: 0, right: 0, zIndex: 10, padding: "8px 0" }}>
+              <div style={{ background: "#0D0D10", border: "1px solid #1A1A22", borderRadius: 12, padding: "10px 16px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}>
+                <div className="spinn" style={{ width: 14, height: 14, border: "2px solid #F59E0B22", borderTopColor: "#F59E0B", borderRadius: "50%" }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: "#E8E6E1" }}>{buildStep}</div>
+                  <div style={{ width: "100%", height: 2, background: "#111", borderRadius: 1, marginTop: 4, overflow: "hidden" }}>
+                    <motion.div initial={{ width: 0 }} animate={{ width: "100%" }} transition={{ duration: 15 }} style={{ height: "100%", background: "#F59E0B" }} />
+                  </div>
+                </div>
+                <div style={{ fontSize: 9, color: "#444", fontFamily: "Geist Mono" }}>ORCHESTRATING...</div>
+              </div>
+            </div>
+          )}
           {msgs.length === 0 && (
             <div className="au">
               <div style={{ textAlign: "center", padding: "24px 0 20px" }}>
@@ -622,23 +1498,91 @@ export default function App() {
           )}
           {msgs.map((m, i) => <ChatMsg key={i} msg={m} />)}
           <div style={{ height: 100 }} />
+          <AnimatePresence>
+            {showScrollBottom && (
+              <motion.button 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 10 }}
+                onClick={() => scrollToBottom()}
+                style={{ 
+                  position: "absolute", 
+                  bottom: 120, 
+                  left: "50%", 
+                  transform: "translateX(-50%)", 
+                  background: "#1A1A22", 
+                  color: "#F59E0B", 
+                  border: "1px solid #F59E0B44", 
+                  borderRadius: 20, 
+                  padding: "6px 12px", 
+                  fontSize: 10, 
+                  fontWeight: 800, 
+                  cursor: "pointer", 
+                  display: "flex", 
+                  alignItems: "center", 
+                  gap: 6,
+                  zIndex: 20,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.5)"
+                }}>
+                <ChevronDown size={12} /> NEW MESSAGES
+              </motion.button>
+            )}
+          </AnimatePresence>
         </div>
 
         {/* Input */}
-        <div style={{ padding: "10px 12px 12px", borderTop: "1px solid #141420", flexShrink: 0, position: "relative" }}>
-          <div className="ios-input-container" style={{ borderRadius: 24, padding: "4px 4px 4px 16px", display: "flex", alignItems: "flex-end", gap: 8 }}>
+        <div style={{ 
+          padding: isMobile ? "8px 10px 10px" : "10px 12px 12px", 
+          borderTop: "1px solid #141420", 
+          flexShrink: 0, 
+          position: "relative",
+          background: "#0A0A0D"
+        }}>
+          {/* Attachments Preview */}
+          {attachments.length > 0 && (
+            <div style={{ display: "flex", gap: 8, overflowX: "auto", padding: "0 4px 8px" }}>
+              {attachments.map((att, i) => (
+                <div key={i} style={{ position: "relative", flexShrink: 0 }}>
+                  <img src={att.data} alt="" style={{ width: 40, height: 40, borderRadius: 8, objectFit: "cover", border: "1px solid #F59E0B44" }} />
+                  <button onClick={() => setAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                    style={{ position: "absolute", top: -4, right: -4, width: 16, height: 16, borderRadius: "50%", background: "#F59E0B", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                    <X size={10} color="#000" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="ios-input-container" style={{ 
+            borderRadius: 24, 
+            padding: isMobile ? "2px 2px 2px 12px" : "4px 4px 4px 16px", 
+            display: "flex", 
+            alignItems: "flex-end", 
+            gap: 8 
+          }}>
+            <button onClick={() => {
+              const input = document.createElement('input');
+              input.type = 'file';
+              input.multiple = true;
+              input.accept = 'image/*';
+              input.onchange = (e: any) => handleFileSelect(e);
+              input.click();
+            }} style={{ background: "transparent", border: "none", cursor: "pointer", padding: "10px 0", color: "#555" }}>
+              <PlusCircle size={20} />
+            </button>
             <textarea ref={inputRef} value={input} onChange={e => setInput(e.target.value)}
+              onPaste={handlePaste}
               onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }}
               onInput={(e: any) => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 110) + "px"; }}
               placeholder="Message SAL Builder..."
               rows={1} style={{ flex: 1, background: "transparent", border: "none", color: "#E8E6E1", fontSize: 14, outline: "none", resize: "none", padding: "10px 0", lineHeight: 1.4, maxHeight: 110, overflowY: "auto", fontFamily: "Geist, sans-serif" }} />
             <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
-              <button style={{ width: 32, height: 32, borderRadius: "50%", border: "none", background: "rgba(255,255,255,0.05)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
-                <Mic size={14} color="#666" />
+              <button onClick={startSpeechToText} style={{ width: 32, height: 32, borderRadius: "50%", border: "none", background: isListening ? "#F59E0B22" : "rgba(255,255,255,0.05)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                <Mic size={14} color={isListening ? "#F59E0B" : "#666"} className={isListening ? "pulseAnim" : ""} />
               </button>
-              <button onClick={() => send(input)} disabled={streaming || !input.trim()}
-                style={{ width: 32, height: 32, borderRadius: "50%", border: "none", background: input.trim() && !streaming ? "#F59E0B" : "rgba(255,255,255,0.03)", display: "flex", alignItems: "center", justifyContent: "center", cursor: input.trim() ? "pointer" : "not-allowed", transition: "all .2s" }}>
-                {streaming ? <div className="spinn" style={{ width: 14, height: 14, border: "2px solid #00000033", borderTopColor: "#000", borderRadius: "50%" }} /> : <Send size={14} color={input.trim() ? "#000" : "#333"} />}
+              <button onClick={() => send(input)} disabled={streaming || (!input.trim() && attachments.length === 0)}
+                style={{ width: 32, height: 32, borderRadius: "50%", border: "none", background: (input.trim() || attachments.length > 0) && !streaming ? "#F59E0B" : "rgba(255,255,255,0.03)", display: "flex", alignItems: "center", justifyContent: "center", cursor: (input.trim() || attachments.length > 0) ? "pointer" : "not-allowed", transition: "all .2s" }}>
+                {streaming ? <div className="spinn" style={{ width: 14, height: 14, border: "2px solid #00000033", borderTopColor: "#000", borderRadius: "50%" }} /> : <Send size={14} color={(input.trim() || attachments.length > 0) ? "#000" : "#333"} />}
               </button>
             </div>
           </div>
@@ -647,15 +1591,24 @@ export default function App() {
       </div>
 
       {/* ── Resizer ── */}
-      <div className="resizer" onMouseDown={() => { resizing.current = true; document.body.style.cursor = "col-resize"; }}
-        style={{ width: 3, background: "#141420", cursor: "col-resize", flexShrink: 0, transition: "background .15s" }}
-        onMouseEnter={e => e.currentTarget.style.background = "#F59E0B44"}
-        onMouseLeave={e => e.currentTarget.style.background = "#141420"} />
+      {!isMobile && (
+        <div className="resizer" onMouseDown={() => { resizing.current = true; document.body.style.cursor = "col-resize"; }}
+          style={{ width: 3, background: "#141420", cursor: "col-resize", flexShrink: 0, transition: "background .15s" }}
+          onMouseEnter={e => e.currentTarget.style.background = "#F59E0B44"}
+          onMouseLeave={e => e.currentTarget.style.background = "#141420"} />
+      )}
 
       {/* ══════════════════════════════════════
           RIGHT PANEL — Preview / Code / Files
       ══════════════════════════════════════ */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#0C0C0F", minWidth: 0 }}>
+      <div style={{ 
+        flex: 1, 
+        display: isMobile && mobileTab !== 'ide' ? "none" : "flex", 
+        flexDirection: "column", 
+        background: "#0C0C0F", 
+        minWidth: 0,
+        height: isMobile ? "calc(100vh - 56px)" : "100%"
+      }}>
 
         {/* Top bar */}
         <div style={{ height: 44, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 12px", borderBottom: "1px solid #141420", background: "#090910", flexShrink: 0, gap: 8 }}>
@@ -666,6 +1619,7 @@ export default function App() {
               ["code", "Code", Code], 
               ["files", "Files", Folder],
               ["simulator", "Simulator", Smartphone],
+              ["tools", "AI Tools", Zap],
               ["settings", "Settings", Settings]
             ].map(([id, label, Icon]: any) => (
               <button key={id} onClick={() => setRightTab(id)}
@@ -796,7 +1750,25 @@ export default function App() {
                   </div>
                 </div>
 
-                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, overflowY: "auto", background: "#08080A" }}>
+                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, overflowY: "auto", background: "#08080A", position: "relative" }}>
+                  {/* Build Log Overlay */}
+                  {isBuilding && (
+                    <div style={{ position: "absolute", top: 20, left: 20, right: 20, bottom: 20, background: "rgba(0,0,0,0.8)", backdropFilter: "blur(10px)", zIndex: 100, borderRadius: 20, border: "1px solid #1A1A22", display: "flex", flexDirection: "column", padding: 30 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+                        <div className="pulse" style={{ width: 12, height: 12, borderRadius: "50%", background: "#F59E0B" }}></div>
+                        <div style={{ fontSize: 16, fontWeight: 800, color: "#E8E6E1" }}>{buildStep}</div>
+                      </div>
+                      <div style={{ flex: 1, overflowY: "auto", fontFamily: "Geist Mono, monospace", fontSize: 12, color: "#555", display: "flex", flexDirection: "column", gap: 8 }}>
+                        {buildLogs.map((log, i) => (
+                          <div key={i} style={{ display: "flex", gap: 12 }}>
+                            <span style={{ color: "#222" }}>[{new Date().toLocaleTimeString()}]</span>
+                            <span style={{ color: log.includes("Successfully") ? "#22C55E" : "#555" }}>{log}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className={`iphone-frame amber-glow device-${device}`} style={{ 
                     width: device === "iphone-15" ? 320 : device === "iphone-se" ? 280 : 500,
                     height: device === "iphone-15" ? 650 : device === "iphone-se" ? 580 : 700,
@@ -820,57 +1792,167 @@ export default function App() {
             </div>
           )}
 
+          {/* AI TOOLS */}
+          {rightTab === "tools" && (
+            <div style={{ flex: 1, overflowY: "auto" }}>
+              <div style={{ padding: "20px 24px 0" }}>
+                <div style={{ fontSize: 18, fontWeight: 800, color: "#E8E6E1", marginBottom: 4 }}>SaintSal™ AI Suite</div>
+                <div style={{ fontSize: 13, color: "#555" }}>Integrate world-class intelligence directly into your HACP builds.</div>
+              </div>
+              <AITools />
+            </div>
+          )}
+
           {/* SETTINGS */}
           {rightTab === "settings" && (
-            <div style={{ flex: 1, padding: 30, overflowY: "auto" }}>
-              <div style={{ maxWidth: 600, margin: "0 auto" }}>
-                <h2 style={{ fontSize: 24, fontWeight: 800, marginBottom: 24, color: "#F59E0B" }}>Settings</h2>
+            <div style={{ flex: 1, padding: 30, overflowY: "auto", background: "#08080A" }}>
+              <div style={{ maxWidth: 700, margin: "0 auto" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 32 }}>
+                  <div style={{ width: 48, height: 48, borderRadius: 12, background: "linear-gradient(135deg,#F59E0B,#D97706)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <Settings size={24} color="#000" />
+                  </div>
+                  <div>
+                    <h2 style={{ fontSize: 24, fontWeight: 800, color: "#E8E6E1" }}>Studio Settings</h2>
+                    <p style={{ fontSize: 13, color: "#555" }}>Configure your SaintSal™ Studio environment and deployment targets.</p>
+                  </div>
+                </div>
                 
-                <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 32 }}>
+                  {/* AI Section */}
                   <section>
-                    <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>AI Configuration</h3>
-                    <div className="glass" style={{ borderRadius: 12, padding: 20 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+                      <Sparkles size={16} color="#F59E0B" />
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", textTransform: "uppercase", letterSpacing: "0.05em" }}>AI Orchestration</h3>
+                    </div>
+                    <div className="glass" style={{ borderRadius: 16, padding: 24, border: "1px solid #1A1A22" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
                         <div>
-                          <div style={{ fontSize: 14, fontWeight: 600 }}>Gemini Model</div>
-                          <div style={{ fontSize: 12, color: "#555" }}>Currently using gemini-2.0-flash-exp</div>
+                          <div style={{ fontSize: 15, fontWeight: 600, color: "#E8E6E1" }}>Gemini 3 Flash</div>
+                          <div style={{ fontSize: 12, color: "#555" }}>High-speed multimodal reasoning engine</div>
                         </div>
-                        <div style={{ background: "#1A1A22", padding: "4px 12px", borderRadius: 6, fontSize: 12, color: "#F59E0B" }}>Active</div>
+                        <div style={{ background: "#F59E0B15", padding: "4px 12px", borderRadius: 20, fontSize: 11, fontWeight: 700, color: "#F59E0B", border: "1px solid #F59E0B33" }}>ACTIVE</div>
                       </div>
-                      <div style={{ borderTop: "1px solid #1A1A22", paddingTop: 16 }}>
-                        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>System Instruction</div>
-                        <div style={{ fontSize: 12, color: "#666", lineHeight: 1.5, background: "#09090D", padding: 12, borderRadius: 8, border: "1px solid #141420" }}>
-                          {BUILDER_SYS.slice(0, 150)}...
+                      <div style={{ borderTop: "1px solid #1A1A22", paddingTop: 20 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "#AAA", marginBottom: 10 }}>System Prompt</div>
+                        <div style={{ fontSize: 12, color: "#666", lineHeight: 1.6, background: "#050507", padding: 16, borderRadius: 12, border: "1px solid #141420", fontFamily: "Geist Mono, monospace" }}>
+                          {BUILDER_SYS.slice(0, 200)}...
                         </div>
                       </div>
                     </div>
                   </section>
 
+                  {/* Environment Variables */}
                   <section>
-                    <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>Deployment</h3>
-                    <div className="glass" style={{ borderRadius: 12, padding: 20 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-                        <div style={{ width: 40, height: 40, borderRadius: 10, background: "#000", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #1A1A22" }}>
-                          <Github size={20} color="#fff" />
-                        </div>
-                        <div>
-                          <div style={{ fontSize: 14, fontWeight: 600 }}>GitHub Integration</div>
-                          <div style={{ fontSize: 12, color: ghConnected ? "#22C55E" : "#555" }}>{ghConnected ? "Connected as ryan-hacp" : "Not connected"}</div>
-                        </div>
-                        <button onClick={() => setGhConnected(!ghConnected)} style={{ marginLeft: "auto", padding: "6px 12px", borderRadius: 6, background: ghConnected ? "#1A1A22" : "#fff", color: ghConnected ? "#fff" : "#000", border: "none", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
-                          {ghConnected ? "Disconnect" : "Connect"}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+                      <Database size={16} color="#F59E0B" />
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", textTransform: "uppercase", letterSpacing: "0.05em" }}>Environment Variables</h3>
+                    </div>
+                    <div className="glass" style={{ borderRadius: 16, padding: 24, border: "1px solid #1A1A22" }}>
+                      <p style={{ fontSize: 12, color: "#555", marginBottom: 20 }}>These variables are injected into your app at build time.</p>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                        {[
+                          { key: "GEMINI_API_KEY", value: "••••••••••••••••", type: "Secret" },
+                          { key: "SAINTSAL_STUDIO_ID", value: "SS-90210-X", type: "System" },
+                          { key: "HACP_PROTOCOL_VERSION", value: "v4.2.0", type: "System" }
+                        ].map(env => (
+                          <div key={env.key} style={{ display: "flex", alignItems: "center", gap: 12, background: "#050507", padding: "10px 16px", borderRadius: 10, border: "1px solid #141420" }}>
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 12, fontWeight: 700, color: "#F59E0B", fontFamily: "Geist Mono" }}>{env.key}</div>
+                              <div style={{ fontSize: 11, color: "#444", fontFamily: "Geist Mono" }}>{env.value}</div>
+                            </div>
+                            <div style={{ fontSize: 10, color: "#333", fontWeight: 700, textTransform: "uppercase" }}>{env.type}</div>
+                          </div>
+                        ))}
+                        <button style={{ marginTop: 8, width: "100%", padding: "10px", borderRadius: 10, border: "1px dashed #1A1A22", background: "transparent", color: "#444", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                          + Add Variable
                         </button>
                       </div>
                     </div>
                   </section>
 
+                  {/* Domain & Deployment */}
                   <section>
-                    <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.05em" }}>About SaintSal™ Labs</h3>
-                    <div style={{ fontSize: 12, color: "#444", lineHeight: 1.6 }}>
-                      SaintSal™ Builder is a proprietary IDE developed by SaintSal™ Labs. 
-                      HACP Protocol enabled. Patent #10,290,222.
-                      <br /><br />
-                      © 2026 SaintSal™ Labs. All rights reserved.
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+                      <Network size={16} color="#F59E0B" />
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", textTransform: "uppercase", letterSpacing: "0.05em" }}>Domain & Publishing</h3>
+                    </div>
+                    <div className="glass" style={{ borderRadius: 16, padding: 24, border: "1px solid #1A1A22" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24 }}>
+                        <div style={{ width: 48, height: 48, borderRadius: 12, background: "#000", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #1A1A22" }}>
+                          <Github size={24} color="#fff" />
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 15, fontWeight: 600 }}>ryan-hacp / {projectName.toLowerCase().replace(/\s+/g, "-")}</div>
+                          <div style={{ fontSize: 12, color: "#22C55E" }}>Connected & Syncing</div>
+                        </div>
+                        <button style={{ padding: "8px 16px", borderRadius: 8, background: "#1A1A22", color: "#fff", border: "none", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Manage</button>
+                      </div>
+                      
+                      <div style={{ borderTop: "1px solid #1A1A22", paddingTop: 24 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: "#AAA", marginBottom: 12 }}>Custom Domain</div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <div style={{ flex: 1, background: "#050507", border: "1px solid #141420", borderRadius: 10, padding: "10px 16px", fontSize: 13, color: "#666" }}>
+                            {projectName.toLowerCase().replace(/\s+/g, "-")}.saintsal.studio
+                          </div>
+                          <button style={{ padding: "0 16px", borderRadius: 10, background: "#F59E0B", color: "#000", border: "none", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                            Configure
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+
+                  {/* PWA & Mobile */}
+                  <section>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+                      <Smartphone size={16} color="#F59E0B" />
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#AAA", textTransform: "uppercase", letterSpacing: "0.05em" }}>PWA & Mobile UX</h3>
+                    </div>
+                    <div className="glass" style={{ borderRadius: 16, padding: 24, border: "1px solid #1A1A22" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                        <div>
+                          <div style={{ fontSize: 15, fontWeight: 600, color: "#E8E6E1" }}>Install SaintSal™ Studio</div>
+                          <div style={{ fontSize: 12, color: "#555" }}>Add to your home screen for a native iOS experience.</div>
+                        </div>
+                        <button 
+                          onClick={installPWA}
+                          disabled={!deferredPrompt}
+                          style={{ 
+                            background: deferredPrompt ? "#F59E0B" : "#1A1A22", 
+                            color: deferredPrompt ? "#000" : "#444", 
+                            padding: "8px 16px", 
+                            borderRadius: 8, 
+                            fontSize: 12, 
+                            fontWeight: 700, 
+                            border: "none", 
+                            cursor: deferredPrompt ? "pointer" : "not-allowed" 
+                          }}
+                        >
+                          {deferredPrompt ? "Install App" : "Installed"}
+                        </button>
+                      </div>
+                      <div style={{ borderTop: "1px solid #1A1A22", paddingTop: 20 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#AAA" }}>Haptic Feedback</div>
+                            <div style={{ fontSize: 11, color: "#444" }}>Subtle vibrations for key interactions (iOS/Android)</div>
+                          </div>
+                          <div style={{ width: 40, height: 20, background: "#22C55E", borderRadius: 10, position: "relative", cursor: "pointer" }}>
+                            <div style={{ position: "absolute", right: 2, top: 2, width: 16, height: 16, background: "#fff", borderRadius: "50%" }} />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section style={{ paddingBottom: 40 }}>
+                    <div className="glass" style={{ borderRadius: 16, padding: 24, border: "1px solid #1A1A22", textAlign: "center" }}>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: "#F59E0B", marginBottom: 8 }}>SaintSal™ Studio v4.2.0</div>
+                      <div style={{ fontSize: 12, color: "#444", lineHeight: 1.6 }}>
+                        HACP Protocol enabled. Patent #10,290,222.<br />
+                        Licensed to Ryan @ HACP Global AI.<br />
+                        © 2026 SaintSal™ Labs. All rights reserved.
+                      </div>
                     </div>
                   </section>
                 </div>
@@ -897,25 +1979,38 @@ export default function App() {
               </div>
 
               {/* Code viewer */}
-              <div style={{ flex: 1, overflow: "auto", background: "#0A0A0D" }}>
+              <div style={{ flex: 1, overflow: "hidden", background: "#0A0A0D", display: "flex", flexDirection: "column" }}>
                 {activeFile ? (
-                  <div>
+                  <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
                     {/* File header */}
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 14px", borderBottom: "1px solid #141420", background: "#090910", position: "sticky", top: 0, zIndex: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 14px", borderBottom: "1px solid #141420", background: "#090910", zIndex: 10 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
                         <span style={{ fontSize: 10, fontWeight: 800, color: fileIcon(activeFile.name).color, fontFamily: "Geist Mono, monospace" }}>{fileIcon(activeFile.name).icon}</span>
                         <span className="mono" style={{ fontSize: 12.5, color: "#B8B4AC" }}>{activeFile.name}</span>
                         <span style={{ fontSize: 9.5, color: "#2A2A34", background: "#111118", padding: "1px 6px", borderRadius: 4, border: "1px solid #1E1E28" }}>{activeFile.lang}</span>
                       </div>
-                      <button onClick={() => navigator.clipboard?.writeText(activeFile.content)}
-                        style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 9px", borderRadius: 5, border: "1px solid #1E1E28", background: "transparent", color: "#555", fontSize: 10.5, cursor: "pointer", fontFamily: "Geist, sans-serif" }}>
-                        <Copy size={10} color="#555" />Copy
-                      </button>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <button onClick={() => saveVersion(projectName.replace(/\s+/g, '-').toLowerCase(), files, `Manual Save ${new Date().toLocaleTimeString()}`)}
+                          style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 9px", borderRadius: 5, border: "1px solid #F59E0B33", background: "#F59E0B11", color: "#F59E0B", fontSize: 10.5, cursor: "pointer", fontFamily: "Geist, sans-serif" }}>
+                          <Save size={10} color="#F59E0B" />Save Snapshot
+                        </button>
+                        <button onClick={() => navigator.clipboard?.writeText(activeFile.content)}
+                          style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 9px", borderRadius: 5, border: "1px solid #1E1E28", background: "transparent", color: "#555", fontSize: 10.5, cursor: "pointer", fontFamily: "Geist, sans-serif" }}>
+                          <Copy size={10} color="#555" />Copy
+                        </button>
+                      </div>
                     </div>
-                    {/* Code */}
-                    <pre style={{ padding: "14px 18px", fontFamily: "Geist Mono, monospace", fontSize: 12.5, lineHeight: 1.7, color: "#C8D3F5", counterReset: "line", minHeight: "100%" }}>
-                      <code dangerouslySetInnerHTML={{ __html: highlight(activeFile.content, activeFile.lang) }} />
-                    </pre>
+                    {/* Code Editor */}
+                    <CodeEditor 
+                      code={activeFile.content} 
+                      lang={activeFile.lang} 
+                      onChange={(newVal) => {
+                        setFiles(prev => ({
+                          ...prev,
+                          [activeFile.name]: { ...activeFile, content: newVal }
+                        }));
+                      }} 
+                    />
                   </div>
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#2A2A34", fontSize: 13.5, flexDirection: "column", gap: 8 }}>
@@ -1012,5 +2107,137 @@ export default function App() {
     </div>
   );
 }
+
+/* ── Prep View Component ────────────────────────────────────── */
+const PrepView = ({ msgs, input, setInput, send, streaming, concepts, isGeneratingConcept, onStartBuild, user, signInWithGoogle, logOut, isMobile, attachments, setAttachments, handleFileSelect, handlePaste, startSpeechToText, isListening }: any) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [msgs, concepts, attachments]);
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#000", color: "#E8E6E1", position: "relative" }}>
+      {/* Hidden File Input */}
+      <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={handleFileSelect} style={{ display: "none" }} />
+
+      {/* Header */}
+      <div style={{ height: 60, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px", borderBottom: "1px solid #111", background: "#08080A", zIndex: 50 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+           <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg,#F59E0B,#D97706)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+             <Sparkles size={18} color="#000" />
+           </div>
+           <span style={{ fontWeight: 800, fontSize: 18, letterSpacing: "-0.02em" }}>SaintSal™ <span style={{ color: "#F59E0B" }}>Prep</span></span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+           {user ? (
+             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+               <img src={user.photoURL || ""} alt="" style={{ width: 28, height: 28, borderRadius: "50%", border: "1px solid #1A1A22" }} />
+               {!isMobile && <button onClick={logOut} style={{ background: "transparent", border: "none", color: "#555", fontSize: 12, cursor: "pointer" }}>Sign Out</button>}
+             </div>
+           ) : (
+             <button onClick={signInWithGoogle} style={{ background: "#F59E0B", color: "#000", border: "none", padding: "8px 16px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Sign In</button>
+           )}
+        </div>
+      </div>
+
+      {/* Chat Area */}
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: isMobile ? "20px 16px" : "40px 20px", display: "flex", flexDirection: "column" }}>
+        <div style={{ maxWidth: 700, margin: "0 auto", width: "100%" }}>
+          {msgs.length === 0 && (
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} style={{ textAlign: "center", padding: "60px 0" }}>
+              <div style={{ width: 64, height: 64, borderRadius: 16, background: "linear-gradient(135deg,#F59E0B11,#D9770611)", border: "1px solid #F59E0B22", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 24px" }}>
+                <BrainCircuit size={32} color="#F59E0B" />
+              </div>
+              <h1 style={{ fontSize: isMobile ? 28 : 42, fontWeight: 900, marginBottom: 12, letterSpacing: "-0.04em" }}>What are we building today?</h1>
+              <p style={{ color: "#555", fontSize: isMobile ? 14 : 18, maxWidth: 500, margin: "0 auto", lineHeight: 1.6 }}>Describe your vision. I'll generate concepts with Nano Banana and then we'll orchestrate the full build.</p>
+            </motion.div>
+          )}
+          
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {msgs.map((m, i) => <ChatMsg key={i} msg={m} />)}
+          </div>
+          
+          {/* Concept Gallery */}
+          {concepts.length > 0 && (
+            <div style={{ marginTop: 32 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+                <ImageIcon size={14} color="#F59E0B" />
+                <div style={{ fontSize: 11, fontWeight: 800, color: "#F59E0B", textTransform: "uppercase", letterSpacing: "0.1em" }}>Nano Banana Concepts</div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: isMobile ? "repeat(2, 1fr)" : "repeat(3, 1fr)", gap: 16 }}>
+                {concepts.map((c, i) => (
+                  <motion.div key={i} initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }}
+                    style={{ aspectRatio: "9/16", borderRadius: 16, overflow: "hidden", border: "1px solid #1A1A22", background: "#050507", boxShadow: "0 10px 30px rgba(0,0,0,0.5)" }}>
+                    <img src={c} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  </motion.div>
+                ))}
+                {isGeneratingConcept && (
+                  <div style={{ aspectRatio: "9/16", borderRadius: 16, background: "#050507", border: "1px dashed #1A1A22", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <RefreshCw size={24} color="#F59E0B" className="animate-spin" />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+        <div style={{ height: 120 }} />
+      </div>
+
+      {/* Footer / Input */}
+      <div style={{ padding: isMobile ? "16px" : "32px", borderTop: "1px solid #111", background: "rgba(8,8,10,0.9)", backdropFilter: "blur(20px)", position: "sticky", bottom: 0 }}>
+        <div style={{ maxWidth: 700, margin: "0 auto", display: "flex", flexDirection: "column", gap: 16 }}>
+          {/* Attachments Preview */}
+          {attachments.length > 0 && (
+            <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 8 }}>
+              {attachments.map((att, i) => (
+                <div key={i} style={{ position: "relative", flexShrink: 0 }}>
+                  <img src={att.data} alt="" style={{ width: 60, height: 60, borderRadius: 12, objectFit: "cover", border: "1px solid #F59E0B44" }} />
+                  <button onClick={() => setAttachments(prev => prev.filter((_, idx) => idx !== i))}
+                    style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, borderRadius: "50%", background: "#F59E0B", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                    <X size={12} color="#000" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 12, background: "#111", borderRadius: 16, padding: "4px 4px 4px 16px", border: "1px solid #1A1A22", alignItems: "flex-end" }}>
+            <button onClick={() => fileInputRef.current?.click()} style={{ background: "transparent", border: "none", cursor: "pointer", padding: "12px 0", color: "#555" }}>
+              <PlusCircle size={22} />
+            </button>
+            <textarea 
+              value={input} 
+              onChange={e => setInput(e.target.value)}
+              onPaste={handlePaste}
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }}
+              placeholder="Describe your app vision..."
+              style={{ flex: 1, background: "transparent", border: "none", color: "#fff", fontSize: 15, outline: "none", resize: "none", padding: "12px 0", lineHeight: 1.5, maxHeight: 120, fontFamily: "Geist, sans-serif" }}
+            />
+            <button onClick={startSpeechToText} style={{ background: "transparent", border: "none", cursor: "pointer", padding: "12px 0", color: isListening ? "#F59E0B" : "#555" }}>
+              <Mic size={22} className={isListening ? "pulseAnim" : ""} />
+            </button>
+            <button onClick={() => send(input)} disabled={streaming || (!input.trim() && attachments.length === 0)}
+              style={{ width: 48, height: 48, borderRadius: 12, background: (input.trim() || attachments.length > 0) ? "#F59E0B" : "#1A1A22", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.2s", marginBottom: 4 }}>
+              {streaming ? <RefreshCw size={20} color="#000" className="animate-spin" /> : <Send size={20} color={(input.trim() || attachments.length > 0) ? "#000" : "#444"} />}
+            </button>
+          </div>
+          
+          {msgs.length > 0 && (
+            <motion.button 
+              initial={{ opacity: 0, y: 10 }} 
+              animate={{ opacity: 1, y: 0 }}
+              onClick={onStartBuild}
+              style={{ width: "100%", padding: "16px", borderRadius: 16, background: "linear-gradient(135deg,#F59E0B,#D97706)", color: "#000", border: "none", fontSize: 16, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 12, boxShadow: "0 10px 20px rgba(245,158,11,0.2)" }}>
+              <Zap size={20} fill="currentColor" />
+              START FULL BUILD
+            </motion.button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
 
 
