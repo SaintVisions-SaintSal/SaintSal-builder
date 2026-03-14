@@ -1,0 +1,9 @@
+{
+  "name": "SaintSal Builder",
+  "description": "A collaborative chat and app builder for iOS.",
+  "requestFramePermissions": [
+    "geolocation",
+    "camera",
+    "microphone"
+  ]
+}
